@@ -5,6 +5,8 @@ var mysql = require('mysql');
 var path = require('path');
 var util = require('util');
 
+const SESS_STORE_INTV_MS = 5 * 60 * 1000; // min 5 minutes between session store touches
+
 var debug = {
 	log: require('debug')('express-mysql-session:log'),
 	error: require('debug')('express-mysql-session:error')
@@ -30,6 +32,7 @@ module.exports = function(session) {
 			connection = null;
 		}
 
+		this.cache = {};
 		this.connection = connection;
 		this.setOptions(options);
 
@@ -145,6 +148,9 @@ module.exports = function(session) {
 	};
 
 	MySQLStore.prototype.get = function(session_id, cb) {
+		var cache      = this.cache;
+		var cachedSess = cache[session_id];
+		if(cachedSess) return onGotSess(cachedSess, true);
 
 		debug.log('Getting session:', session_id);
 
@@ -172,6 +178,19 @@ module.exports = function(session) {
 				return cb(null, null);
 			}
 
+			try {
+				row.data_sess = JSON.parse(row.data);
+				delete row.data;
+			} catch (error) {
+				debug.error('Failed to parse data for session (' + session_id + ')');
+				debug.error(error);
+				return cb(error);
+			}
+
+			onGotSess(row, false);
+		});
+
+		function onGotSess(row, fromCache) {
 			// Check the expires time.
 			var now = Math.round(Date.now() / 1000);
 			if (row.expires < now) {
@@ -179,29 +198,26 @@ module.exports = function(session) {
 				return cb(null, null);
 			}
 
-			try {
-				var session = JSON.parse(row.data);
-			} catch (error) {
-				debug.error('Failed to parse data for session (' + session_id + ')');
-				debug.error(error);
-				return cb(error);
+			// Cache it for next time
+			if(!fromCache) {
+				cache[session_id] = row;
 			}
-
-			cb(null, session);
-		});
+			
+			cb(null, row.data_sess);
+		}
 	};
 
-	MySQLStore.prototype.set = function(session_id, data, cb) {
+	MySQLStore.prototype.set = function(session_id, data_sess, cb) {
 
 		debug.log('Setting session:', session_id);
 
 		var expires;
 
-		if (data.cookie) {
-			if (data.cookie.expires) {
-				expires = data.cookie.expires;
-			} else if (data.cookie._expires) {
-				expires = data.cookie._expires;
+		if (data_sess.cookie) {
+			if (data_sess.cookie.expires) {
+				expires = data_sess.cookie.expires;
+			} else if (data_sess.cookie._expires) {
+				expires = data_sess.cookie._expires;
 			}
 		}
 
@@ -216,7 +232,7 @@ module.exports = function(session) {
 		// Use whole seconds here; not milliseconds.
 		expires = Math.round(expires.getTime() / 1000);
 
-		data = JSON.stringify(data);
+		var data = JSON.stringify(data_sess);
 
 		var sql = 'INSERT INTO ?? (??, ??, ??) VALUES (?, ?, ?) ON DUPLICATE KEY UPDATE ?? = VALUES(??), ?? = VALUES(??)';
 
@@ -234,12 +250,16 @@ module.exports = function(session) {
 			this.options.schema.columnNames.data
 		];
 
+		var cache = this.cache;
 		this.query(sql, params, function(error) {
 
 			if (error) {
 				debug.error('Failed to insert session data.');
 				debug.error(error);
 				return cb && cb(error);
+			} else {
+				// Update cache
+				cache[session_id] = {expires, data_sess};
 			}
 
 			cb && cb();
@@ -247,9 +267,6 @@ module.exports = function(session) {
 	};
 
 	MySQLStore.prototype.touch = function(session_id, data, cb) {
-
-		debug.log('Touching session:', session_id);
-
 		var expires;
 
 		if (data.cookie) {
@@ -270,6 +287,22 @@ module.exports = function(session) {
 
 		// Use whole seconds here; not milliseconds.
 		expires = Math.round(expires.getTime() / 1000);
+
+		// Update cache
+		var now		   = Date.now();
+		var cachedSess = this.cache[session_id];
+		if(cachedSess) {
+			cachedSess.expires = expires;
+
+			if(cachedSess.touch_ts && (now-cachedSess.touch_ts) < SESS_STORE_INTV_MS) {
+				// Just touch the cached session; we'll update the DB less frequently
+				return cb && cb();
+			} else {
+				cachedSess.touch_ts = now;
+			}
+		}
+
+		debug.log('Touching session:', session_id);
 
 		// LIMIT not needed here because the WHERE clause is searching by the table's primary key.
 		var sql = 'UPDATE ?? SET ?? = ? WHERE ?? = ?';
@@ -307,12 +340,16 @@ module.exports = function(session) {
 			session_id
 		];
 
+		var cache = this.cache;
 		this.query(sql, params, function(error) {
 
 			if (error) {
 				debug.error('Failed to destroy session (' + session_id + ')');
 				debug.error(error);
 				return cb && cb(error);
+			} else {
+				// Update cache
+				delete cache[session_id];
 			}
 
 			cb && cb();
@@ -345,41 +382,6 @@ module.exports = function(session) {
 		});
 	};
 
-	MySQLStore.prototype.all = function(cb) {
-
-		debug.log('Getting all sessions');
-
-		var sql = 'SELECT * FROM ?? WHERE ?? >= ?';
-
-		var params = [
-			this.options.schema.tableName,
-			this.options.schema.columnNames.expires,
-			Math.round(Date.now() / 1000)
-		];
-
-		this.query(sql, params, function(error, rows) {
-
-			if (error) {
-				debug.error('Failed to get all sessions.');
-				debug.error(error);
-				return cb && cb(error);
-			}
-
-			var sessions = _.chain(rows).map(function(row) {
-				try {
-					var data = JSON.parse(row.data);
-				} catch (error) {
-					debug.error('Failed to parse data for session (' + row.session_id + ')');
-					debug.error(error);
-					return null;
-				}
-				return [row.session_id, data];
-			}).compact().object().value();
-
-			cb && cb(null, sessions);
-		});
-	};
-
 	MySQLStore.prototype.clear = function(cb) {
 
 		debug.log('Clearing all sessions');
@@ -390,6 +392,7 @@ module.exports = function(session) {
 			this.options.schema.tableName
 		];
 
+		this.cache = {};
 		this.query(sql, params, function(error) {
 
 			if (error) {
@@ -413,6 +416,8 @@ module.exports = function(session) {
 			this.options.schema.columnNames.expires,
 			Math.round(Date.now() / 1000)
 		];
+
+		// TODO: Delete from cache (it's ok though because they won't be used)
 
 		this.query(sql, params, function(error) {
 
