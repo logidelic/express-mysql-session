@@ -5,7 +5,7 @@ var mysql = require('mysql');
 var path = require('path');
 var util = require('util');
 
-const SESS_STORE_INTV_MS = 5 * 60 * 1000; // min 5 minutes between session store touches
+var SESS_STORE_INTV_MS = 5 * 60 * 1000; // min 5 minutes between session store touches
 
 var debug = {
 	log: require('debug')('express-mysql-session:log'),
