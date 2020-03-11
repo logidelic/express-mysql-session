@@ -259,7 +259,7 @@ module.exports = function(session) {
 				return cb && cb(error);
 			} else {
 				// Update cache
-				cache[session_id] = {expires, data_sess};
+				cache[session_id] = {expires:expires, data_sess:data_sess};
 			}
 
 			cb && cb();
