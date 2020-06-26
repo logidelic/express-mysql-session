@@ -203,7 +203,7 @@ module.exports = function(session) {
 				cache[session_id] = row;
 			}
 			
-			cb(null, row.data_sess);
+			cb(null, {...row.data_sess});
 		}
 	};
 
